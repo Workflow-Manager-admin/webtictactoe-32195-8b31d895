@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import './App.css';
 
 // Color palette (from requirements)
@@ -7,6 +7,9 @@ const COLORS = {
   secondary: '#424242',
   accent: '#ff5722',
 };
+
+// Backend API URL (adjust if backend is on different host/port in deployment)
+const API_URL = 'https://vscode-internal-6237-qa.qa01.cloud.kavia.ai:3001';
 
 // Square component for the board
 function Square({ value, onClick, disabled }) {
@@ -48,10 +51,14 @@ function Board({ squares, onSquareClick, disabled }) {
   );
 }
 
-// Status/Panel
-function StatusPanel({ currentPlayer, winner, draw }) {
+// Status panel with error display
+function StatusPanel({ currentPlayer, winner, draw, status, error }) {
   let message;
-  if (winner) {
+  if (error) {
+    message = (
+      <span style={{ color: '#e53935', fontWeight: 600 }}>{error}</span>
+    );
+  } else if (winner) {
     message = (
       <span>
         <span style={{ color: winner === 'X' ? COLORS.primary : COLORS.accent, fontWeight: 700 }}>{winner}</span> wins!
@@ -60,6 +67,10 @@ function StatusPanel({ currentPlayer, winner, draw }) {
   } else if (draw) {
     message = (
       <span style={{ color: COLORS.secondary, fontWeight: 600 }}>It's a Draw!</span>
+    );
+  } else if (status) {
+    message = (
+      <span style={{ color: COLORS.secondary, fontWeight: 500 }}>{status}</span>
     );
   } else {
     message = (
@@ -75,61 +86,140 @@ function StatusPanel({ currentPlayer, winner, draw }) {
   );
 }
 
-// Helpers
-function getWinner(board) {
-  const lines = [
-    // Rows
-    [[0,0],[0,1],[0,2]],
-    [[1,0],[1,1],[1,2]],
-    [[2,0],[2,1],[2,2]],
-    // Cols
-    [[0,0],[1,0],[2,0]],
-    [[0,1],[1,1],[2,1]],
-    [[0,2],[1,2],[2,2]],
-    // Diags
-    [[0,0],[1,1],[2,2]],
-    [[0,2],[1,1],[2,0]],
-  ];
-  for (const line of lines) {
-    const [a, b, c] = line;
-    const v1 = board[a[0]][a[1]];
-    if (v1 && v1 === board[b[0]][b[1]] && v1 === board[c[0]][c[1]]) {
-      return v1;
-    }
-  }
-  return null;
-}
-
-function isDraw(board) {
-  return !getWinner(board) && board.flat().every(Boolean);
-}
-
 // PUBLIC_INTERFACE
 function App() {
-  // Local state for UI; replace with API-backed logic when backend is ready
+  // Backend state
   const emptyBoard = [
     [null, null, null],
     [null, null, null],
     [null, null, null],
   ];
+  const [gameId, setGameId] = useState(null);
   const [board, setBoard] = useState(emptyBoard);
   const [currentPlayer, setCurrentPlayer] = useState('X');
-  const winner = getWinner(board);
-  const draw = isDraw(board);
+  const [winner, setWinner] = useState(null);
+  const [draw, setDraw] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [status, setStatus] = useState('');
+  const [canInteract, setCanInteract] = useState(true);
 
-  // Handle user clicks (simulate moves)
-  function handleSquareClick(i, j) {
-    if (board[i][j] || winner) return;
-    const updated = board.map((row, x) => row.map((cell, y) => (x === i && y === j ? currentPlayer : cell)));
-    setBoard(updated);
-    setCurrentPlayer(currentPlayer === 'X' ? 'O' : 'X');
-  }
+  // Utility - parse game state and set UI state accordingly
+  const updateFromGameState = useCallback((data) => {
+    setGameId(data.game_id);
+    setBoard(data.board.map(row => row.map(cell => cell || null)));
+    setCurrentPlayer(data.next_turn || 'X');
+    setWinner(data.winner || (data.state === 'won' && data.next_turn !== null ? data.next_turn : null));
+    setDraw(data.state === 'draw');
+    setStatus('');
+  }, []);
 
-  // Restart the game
-  function restartGame() {
-    setBoard(emptyBoard);
-    setCurrentPlayer('X');
-  }
+  // Start new game (on load or restart)
+  const startNewGame = useCallback(async () => {
+    setLoading(true);
+    setError('');
+    setStatus('Starting game...');
+    try {
+      const res = await fetch(`${API_URL}/game`, { method: 'POST' });
+      if (!res.ok) throw new Error('Failed to start new game.');
+      const data = await res.json();
+      updateFromGameState(data);
+    } catch (err) {
+      setError('Could not connect to server. Please try again.');
+      setBoard(emptyBoard);
+      setGameId(null);
+    } finally {
+      setLoading(false);
+      setStatus('');
+      setCanInteract(true);
+    }
+  }, [updateFromGameState]);
+
+  // Fetch game state (optional), e.g. if "sync" needed
+  const fetchGameState = useCallback(async (gid) => {
+    setLoading(true);
+    setError('');
+    try {
+      const res = await fetch(`${API_URL}/game/${gid}`, { method: 'GET' });
+      if (!res.ok) throw new Error('Game not found.');
+      const data = await res.json();
+      updateFromGameState(data);
+    } catch (err) {
+      setError('Game not found or server error.');
+    } finally {
+      setLoading(false);
+    }
+  }, [updateFromGameState]);
+
+  // Make a move
+  const handleSquareClick = async (i, j) => {
+    if (!canInteract || loading || !gameId || winner || draw || board[i][j]) return;
+    setLoading(true);
+    setError('');
+    setStatus('Making move...');
+    setCanInteract(false);
+    try {
+      const res = await fetch(`${API_URL}/game/${gameId}/move`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ row: i, col: j, player: currentPlayer }),
+      });
+      if (res.status === 404) throw new Error('Game not found.');
+      if (res.status === 400) {
+        const errText = await res.text();
+        setError('Invalid move. Try another square.');
+        setCanInteract(true);
+        setLoading(false);
+        setStatus('');
+        return;
+      }
+      if (!res.ok) throw new Error('Move error.');
+      const data = await res.json();
+      setBoard(data.board.map(row => row.map(cell => cell || null)));
+      setCurrentPlayer(data.next_turn || currentPlayer); // If null, game over
+      setWinner(data.winner || (data.state === 'won' ? currentPlayer : null));
+      setDraw(data.state === 'draw');
+    } catch (err) {
+      setError(err.message || 'Move failed.');
+    } finally {
+      setLoading(false);
+      setStatus('');
+      setCanInteract(true);
+    }
+  };
+
+  // Restart the current game (keeping the same gameId)
+  const restartGame = useCallback(async () => {
+    if (!gameId) {
+      await startNewGame();
+      return;
+    }
+    setLoading(true);
+    setError('');
+    setStatus('Restarting...');
+    setCanInteract(false);
+    try {
+      const res = await fetch(`${API_URL}/game/${gameId}/restart`, {
+        method: 'POST',
+      });
+      if (!res.ok) throw new Error('Restart failed.');
+      const data = await res.json();
+      updateFromGameState(data);
+    } catch (err) {
+      setError('Could not restart game. Starting new...');
+      await startNewGame();
+    } finally {
+      setLoading(false);
+      setStatus('');
+      setCanInteract(true);
+    }
+  }, [gameId, startNewGame, updateFromGameState]);
+
+  // On mount, start a new game
+  useEffect(() => {
+    startNewGame();
+    // eslint-disable-next-line
+  }, []);
 
   return (
     <div className="app ttt-app light-bg">
@@ -148,10 +238,25 @@ function App() {
       <main style={{ background: '#fafbfc', minHeight: 600 }}>
         <div className="container">
           <div className="ttt-game-shell">
-            <StatusPanel currentPlayer={currentPlayer} winner={winner} draw={draw} />
-            <Board squares={board} onSquareClick={handleSquareClick} disabled={Boolean(winner || draw)} />
+            <StatusPanel
+              currentPlayer={currentPlayer}
+              winner={winner}
+              draw={draw}
+              status={status}
+              error={error}
+            />
+            <Board
+              squares={board}
+              onSquareClick={handleSquareClick}
+              disabled={Boolean(winner || draw || loading || !canInteract)}
+            />
             <div className="ttt-controls">
-              <button className="btn btn-large ttt-ctrl-btn" style={{ background: COLORS.accent, color: '#fff' }} onClick={restartGame}>
+              <button
+                className="btn btn-large ttt-ctrl-btn"
+                style={{ background: COLORS.accent, color: '#fff' }}
+                onClick={restartGame}
+                disabled={loading}
+              >
                 {winner || draw ? 'Play Again' : 'Restart'}
               </button>
             </div>
